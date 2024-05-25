@@ -12,21 +12,29 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::VecDeque;
+
 use clap::builder::NonEmptyStringValueParser;
 use clap_complete::ArgValueCandidates;
+use jj_lib::commit::Commit;
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::op_store::RefTarget;
+use jj_lib::view::View;
 
 use super::has_tracked_remote_bookmarks;
 use super::is_fast_forward;
 use crate::cli_util::CommandHelper;
 use crate::cli_util::RevisionArg;
+use crate::command_error::user_error;
 use crate::command_error::user_error_with_hint;
 use crate::command_error::CommandError;
 use crate::complete;
 use crate::ui::Ui;
 
 /// Create or update a bookmark to point to a certain commit
+///
+/// Without any bookmark `NAMES`, Jujutsu will use the bookmark pointing to the
+/// closest ancestor of the target.
 #[derive(clap::Args, Clone, Debug)]
 pub struct BookmarkSetArgs {
     /// The bookmark's target revision
@@ -39,7 +47,6 @@ pub struct BookmarkSetArgs {
 
     /// The bookmarks to update
     #[arg(
-        required = true,
         value_parser = NonEmptyStringValueParser::new(),
         add = ArgValueCandidates::new(complete::local_bookmarks),
     )]
@@ -55,10 +62,20 @@ pub fn cmd_bookmark_set(
     let target_commit = workspace_command
         .resolve_single_rev(ui, args.revision.as_ref().unwrap_or(&RevisionArg::AT))?;
     let repo = workspace_command.repo().as_ref();
-    let bookmark_names = &args.names;
     let mut new_bookmark_count = 0;
     let mut moved_bookmark_count = 0;
-    for name in bookmark_names {
+
+    let bookmark_names = if !args.names.is_empty() {
+        args.names.clone()
+    } else {
+        find_closest_bookmarks(&target_commit, repo.view())
+    };
+
+    if bookmark_names.is_empty() {
+        return Err(user_error("No bookmarks found."));
+    }
+
+    for name in &bookmark_names {
         let old_target = repo.view().get_local_bookmark(name);
         // If a bookmark is absent locally but is still tracking remote bookmarks,
         // we are resurrecting the local bookmark, not "creating" a new bookmark.
@@ -76,7 +93,7 @@ pub fn cmd_bookmark_set(
     }
 
     let mut tx = workspace_command.start_transaction();
-    for bookmark_name in bookmark_names {
+    for bookmark_name in &bookmark_names {
         tx.repo_mut().set_local_bookmark_target(
             bookmark_name,
             RefTarget::normal(target_commit.id().clone()),
@@ -118,4 +135,40 @@ pub fn cmd_bookmark_set(
         ),
     )?;
     Ok(())
+}
+
+fn find_closest_bookmarks(commit: &Commit, view: &View) -> Vec<String> {
+    let mut closest_bookmarks = Vec::new();
+    let mut closest_distance = None;
+    let mut ancestor_queue: VecDeque<_> = commit
+        .parents()
+        .filter_map(|c| c.ok())
+        .map(|c| (c, 1u32))
+        .collect();
+
+    while let Some((commit, distance)) = ancestor_queue.pop_front() {
+        if closest_distance.is_some() && distance > closest_distance.unwrap() {
+            // A closer bookmark has already been found, abandon this path
+            break;
+        }
+
+        let bookmarks_for_commit: Vec<_> = view
+            .local_bookmarks_for_commit(commit.id())
+            .map(|(name, _)| name.to_string())
+            .collect();
+
+        if !bookmarks_for_commit.is_empty() {
+            closest_bookmarks.extend(bookmarks_for_commit);
+            closest_distance = Some(distance);
+        } else {
+            ancestor_queue.extend(
+                commit
+                    .parents()
+                    .filter_map(|c| c.ok())
+                    .map(|c| (c, distance + 1)),
+            );
+        }
+    }
+
+    closest_bookmarks
 }
